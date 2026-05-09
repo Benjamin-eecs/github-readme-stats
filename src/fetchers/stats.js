@@ -38,28 +38,8 @@ const GRAPHQL_REPOS_QUERY = `
   }
 `;
 
-const GRAPHQL_CONTRIB_QUERY = `
-  query userInfo($login: String!, $contribAfter: String) {
-    user(login: $login) {
-      repositoriesContributedTo(first: 100, contributionTypes: [COMMIT, ISSUE, PULL_REQUEST, REPOSITORY], after: $contribAfter) {
-        totalCount
-        nodes {
-          name
-          stargazers {
-            totalCount
-          }
-        }
-        pageInfo {
-          hasNextPage
-          endCursor
-        }
-      }
-    }
-  }
-`;
-
 const GRAPHQL_STATS_QUERY = `
-  query userInfo($login: String!, $after: String, $contribAfter: String, $includeMergedPullRequests: Boolean!, $includeDiscussions: Boolean!, $includeDiscussionsAnswers: Boolean!, $startTime: DateTime = null) {
+  query userInfo($login: String!, $after: String, $includeMergedPullRequests: Boolean!, $includeDiscussions: Boolean!, $includeDiscussionsAnswers: Boolean!, $startTime: DateTime = null) {
     user(login: $login) {
       name
       login
@@ -69,18 +49,8 @@ const GRAPHQL_STATS_QUERY = `
       reviews: contributionsCollection {
         totalPullRequestReviewContributions
       }
-      repositoriesContributedTo(first: 100, contributionTypes: [COMMIT, ISSUE, PULL_REQUEST, REPOSITORY], after: $contribAfter) {
+      repositoriesContributedTo(first: 1, contributionTypes: [COMMIT, ISSUE, PULL_REQUEST, REPOSITORY]) {
         totalCount
-        nodes {
-          name
-          stargazers {
-            totalCount
-          }
-        }
-        pageInfo {
-          hasNextPage
-          endCursor
-        }
       }
       pullRequests(first: 1) {
         totalCount
@@ -120,18 +90,6 @@ const fetcher = (variables, token) => {
   return request(
     {
       query,
-      variables,
-    },
-    {
-      Authorization: `bearer ${token}`,
-    },
-  );
-};
-
-const contribFetcher = (variables, token) => {
-  return request(
-    {
-      query: GRAPHQL_CONTRIB_QUERY,
       variables,
     },
     {
@@ -197,28 +155,6 @@ const statsFetcher = async ({
     endCursor = res.data.data.user.repositories.pageInfo.endCursor;
   }
 
-  // Paginate `repositoriesContributedTo` to gather stars from contributed-to repos.
-  let contribHasNextPage =
-    stats.data.data.user.repositoriesContributedTo.pageInfo.hasNextPage;
-  let contribEndCursor =
-    stats.data.data.user.repositoriesContributedTo.pageInfo.endCursor;
-  while (contribHasNextPage) {
-    const res = await retryer(contribFetcher, {
-      login: username,
-      contribAfter: contribEndCursor,
-    });
-    if (res.data.errors) {
-      break;
-    }
-    stats.data.data.user.repositoriesContributedTo.nodes.push(
-      ...res.data.data.user.repositoriesContributedTo.nodes,
-    );
-    contribHasNextPage =
-      res.data.data.user.repositoriesContributedTo.pageInfo.hasNextPage;
-    contribEndCursor =
-      res.data.data.user.repositoriesContributedTo.pageInfo.endCursor;
-  }
-
   return stats;
 };
 
@@ -252,6 +188,39 @@ const fetchTotalCommits = (variables, token) => {
  * @description Done like this because the GitHub API does not provide a way to fetch all the commits. See
  * #92#issuecomment-661026467 and #211 for more information.
  */
+/**
+ * Fetch stargazer counts for an explicit list of "owner/name" repos via a
+ * single batched GraphQL query (using aliases). Invalid or inaccessible repos
+ * are silently skipped.
+ *
+ * @param {string[]} repos Array of "owner/name" strings.
+ * @returns {Promise<{nameWithOwner: string, stars: number}[]>}
+ */
+const extraRepoStarsFetcher = async (repos) => {
+  const valid = repos
+    .map((r) => r.trim())
+    .filter((r) => /^[\w.-]+\/[\w.-]+$/.test(r));
+  if (valid.length === 0) {
+    return [];
+  }
+  const aliases = valid
+    .map(
+      (r, i) =>
+        `r${i}: repository(owner: "${r.split("/")[0]}", name: "${r.split("/")[1]}") { nameWithOwner stargazerCount }`,
+    )
+    .join("\n");
+  const query = `query { ${aliases} }`;
+  const res = await retryer(
+    (variables, token) =>
+      request({ query }, { Authorization: `bearer ${token}` }),
+    {},
+  );
+  const data = res?.data?.data || {};
+  return Object.values(data)
+    .filter((v) => v && typeof v.stargazerCount === "number")
+    .map((v) => ({ nameWithOwner: v.nameWithOwner, stars: v.stargazerCount }));
+};
+
 const totalCommitsFetcher = async (username) => {
   if (!githubUsernameRegex.test(username)) {
     logger.log("Invalid username provided.");
@@ -286,6 +255,7 @@ const totalCommitsFetcher = async (username) => {
  * @param {boolean} include_discussions Include discussions.
  * @param {boolean} include_discussions_answers Include discussions answers.
  * @param {number|undefined} commits_year Year to count total commits
+ * @param {string[]} include_repos Extra "owner/name" repos whose stars to add.
  * @returns {Promise<import("./types").StatsData>} Stats data.
  */
 const fetchStats = async (
@@ -296,6 +266,7 @@ const fetchStats = async (
   include_discussions = false,
   include_discussions_answers = false,
   commits_year,
+  include_repos = [],
 ) => {
   if (!username) {
     throw new MissingParamError(["username"]);
@@ -378,26 +349,26 @@ const fetchStats = async (
   const allExcludedRepos = [...exclude_repo, ...excludeRepositories];
   let repoToHide = new Set(allExcludedRepos);
 
-  // Sum stars from owned repos + contributed-to repos (deduped by name).
-  const seenStarRepos = new Set();
-  const allStarNodes = [
-    ...user.repositories.nodes,
-    ...(user.repositoriesContributedTo?.nodes || []),
-  ];
-  stats.totalStars = allStarNodes
+  stats.totalStars = user.repositories.nodes
     .filter((data) => {
-      if (repoToHide.has(data.name)) {
-        return false;
-      }
-      if (seenStarRepos.has(data.name)) {
-        return false;
-      }
-      seenStarRepos.add(data.name);
-      return true;
+      return !repoToHide.has(data.name);
     })
     .reduce((prev, curr) => {
       return prev + curr.stargazers.totalCount;
     }, 0);
+
+  // Add stars from explicit `include_repos` whitelist (e.g. major contributions
+  // in org-owned repos that GitHub doesn't attribute to the user). Dedupes by
+  // nameWithOwner to avoid double counting if the user already owns the repo.
+  if (include_repos && include_repos.length > 0) {
+    const seenOwnedRepos = new Set(
+      user.repositories.nodes.map((r) => `${user.login}/${r.name}`),
+    );
+    const extras = await extraRepoStarsFetcher(include_repos);
+    stats.totalStars += extras
+      .filter((e) => !seenOwnedRepos.has(e.nameWithOwner))
+      .reduce((sum, e) => sum + e.stars, 0);
+  }
 
   stats.rank = calculateRank({
     all_commits: include_all_commits,
