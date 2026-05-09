@@ -15,7 +15,7 @@ dotenv.config();
 
 // GraphQL queries.
 const GRAPHQL_REPOS_FIELD = `
-  repositories(first: 100, ownerAffiliations: [OWNER, ORGANIZATION_MEMBER], orderBy: {direction: DESC, field: STARGAZERS}, after: $after) {
+  repositories(first: 100, ownerAffiliations: OWNER, orderBy: {direction: DESC, field: STARGAZERS}, after: $after) {
     totalCount
     nodes {
       name
@@ -38,8 +38,28 @@ const GRAPHQL_REPOS_QUERY = `
   }
 `;
 
+const GRAPHQL_CONTRIB_QUERY = `
+  query userInfo($login: String!, $contribAfter: String) {
+    user(login: $login) {
+      repositoriesContributedTo(first: 100, contributionTypes: [COMMIT, ISSUE, PULL_REQUEST, REPOSITORY], after: $contribAfter) {
+        totalCount
+        nodes {
+          name
+          stargazers {
+            totalCount
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+`;
+
 const GRAPHQL_STATS_QUERY = `
-  query userInfo($login: String!, $after: String, $includeMergedPullRequests: Boolean!, $includeDiscussions: Boolean!, $includeDiscussionsAnswers: Boolean!, $startTime: DateTime = null) {
+  query userInfo($login: String!, $after: String, $contribAfter: String, $includeMergedPullRequests: Boolean!, $includeDiscussions: Boolean!, $includeDiscussionsAnswers: Boolean!, $startTime: DateTime = null) {
     user(login: $login) {
       name
       login
@@ -49,8 +69,18 @@ const GRAPHQL_STATS_QUERY = `
       reviews: contributionsCollection {
         totalPullRequestReviewContributions
       }
-      repositoriesContributedTo(first: 1, contributionTypes: [COMMIT, ISSUE, PULL_REQUEST, REPOSITORY]) {
+      repositoriesContributedTo(first: 100, contributionTypes: [COMMIT, ISSUE, PULL_REQUEST, REPOSITORY], after: $contribAfter) {
         totalCount
+        nodes {
+          name
+          stargazers {
+            totalCount
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
       }
       pullRequests(first: 1) {
         totalCount
@@ -90,6 +120,18 @@ const fetcher = (variables, token) => {
   return request(
     {
       query,
+      variables,
+    },
+    {
+      Authorization: `bearer ${token}`,
+    },
+  );
+};
+
+const contribFetcher = (variables, token) => {
+  return request(
+    {
+      query: GRAPHQL_CONTRIB_QUERY,
       variables,
     },
     {
@@ -153,6 +195,28 @@ const statsFetcher = async ({
       repoNodes.length === repoNodesWithStars.length &&
       res.data.data.user.repositories.pageInfo.hasNextPage;
     endCursor = res.data.data.user.repositories.pageInfo.endCursor;
+  }
+
+  // Paginate `repositoriesContributedTo` to gather stars from contributed-to repos.
+  let contribHasNextPage =
+    stats.data.data.user.repositoriesContributedTo.pageInfo.hasNextPage;
+  let contribEndCursor =
+    stats.data.data.user.repositoriesContributedTo.pageInfo.endCursor;
+  while (contribHasNextPage) {
+    const res = await retryer(contribFetcher, {
+      login: username,
+      contribAfter: contribEndCursor,
+    });
+    if (res.data.errors) {
+      break;
+    }
+    stats.data.data.user.repositoriesContributedTo.nodes.push(
+      ...res.data.data.user.repositoriesContributedTo.nodes,
+    );
+    contribHasNextPage =
+      res.data.data.user.repositoriesContributedTo.pageInfo.hasNextPage;
+    contribEndCursor =
+      res.data.data.user.repositoriesContributedTo.pageInfo.endCursor;
   }
 
   return stats;
@@ -314,9 +378,22 @@ const fetchStats = async (
   const allExcludedRepos = [...exclude_repo, ...excludeRepositories];
   let repoToHide = new Set(allExcludedRepos);
 
-  stats.totalStars = user.repositories.nodes
+  // Sum stars from owned repos + contributed-to repos (deduped by name).
+  const seenStarRepos = new Set();
+  const allStarNodes = [
+    ...user.repositories.nodes,
+    ...(user.repositoriesContributedTo?.nodes || []),
+  ];
+  stats.totalStars = allStarNodes
     .filter((data) => {
-      return !repoToHide.has(data.name);
+      if (repoToHide.has(data.name)) {
+        return false;
+      }
+      if (seenStarRepos.has(data.name)) {
+        return false;
+      }
+      seenStarRepos.add(data.name);
+      return true;
     })
     .reduce((prev, curr) => {
       return prev + curr.stargazers.totalCount;
